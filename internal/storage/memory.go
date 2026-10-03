@@ -145,13 +145,6 @@ func (m *MemoryRepository) ReviewCommand(
 	}
 
 	nextCommand := cloneCommand(command)
-	if decision.IsClear() {
-		nextCommand.ReserveDriveUnits(gate.TravelUnits(nextCommand.TargetAperture))
-		if err := m.acquireDriveLocked(gate.Station, nextCommand.ID, nextCommand.DriveUnits); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
-		}
-	}
-
 	if err := nextCommand.Review(decision, token, now); err != nil {
 		return domain.GateCommand{}, domain.Gate{}, err
 	}
@@ -159,6 +152,12 @@ func (m *MemoryRepository) ReviewCommand(
 	nextGate := gate
 	if decision.IsClear() {
 		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
+			return domain.GateCommand{}, domain.Gate{}, err
+		}
+		// 只有在复核通过且闸门占用成立后才占用泵站共享额度，
+		// 未成立的复核不得在账本上留下任何占用。
+		nextCommand.ReserveDriveUnits(gate.TravelUnits(nextCommand.TargetAperture))
+		if err := m.acquireDriveLocked(gate.Station, nextCommand.ID, nextCommand.DriveUnits); err != nil {
 			return domain.GateCommand{}, domain.Gate{}, err
 		}
 	}
@@ -198,6 +197,9 @@ func (m *MemoryRepository) ExecuteCommand(
 		return domain.GateCommand{}, domain.Gate{}, err
 	}
 
+	// 在终态转换清零 DriveUnits 之前记下当初预留的行程量，
+	// 无论调整正常完成还是故障中止，结束时都按该量精确归还。
+	releasedUnits := nextCommand.ReleasedDriveUnits()
 	if simulateFault {
 		if err := nextGate.Settle(nextCommand.TargetAperture, true, now); err != nil {
 			return domain.GateCommand{}, domain.Gate{}, err
@@ -212,8 +214,8 @@ func (m *MemoryRepository) ExecuteCommand(
 		if err := nextCommand.Complete(now); err != nil {
 			return domain.GateCommand{}, domain.Gate{}, err
 		}
-		m.releaseDriveLocked(nextGate.Station, nextCommand.ID, nextCommand.ReleasedDriveUnits())
 	}
+	m.releaseDriveLocked(nextGate.Station, nextCommand.ID, releasedUnits)
 
 	m.commands[nextCommand.ID] = nextCommand
 	m.gates[nextGate.ID] = nextGate
