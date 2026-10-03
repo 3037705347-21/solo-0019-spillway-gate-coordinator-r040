@@ -121,11 +121,6 @@ func (c *GateCommand) ReserveDriveUnits(units int) {
 	c.DriveUnits = units
 }
 
-// ReleasedDriveUnits 返回归还泵站额度时应当释放的行程量。
-func (c GateCommand) ReleasedDriveUnits() int {
-	return c.DriveUnits
-}
-
 func (c *GateCommand) BeginExecution(token, operator string, now time.Time) error {
 	if c.Status != CommandApproved {
 		return Conflict("command_not_executable", "only approved commands can execute")

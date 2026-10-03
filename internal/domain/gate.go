@@ -74,9 +74,10 @@ func NewGate(id, name string, maxAperture, initialAperture float64, now time.Tim
 	}, nil
 }
 
-// TravelUnits 返回把闸门移动到目标开度需要占用的泵站行程额度。
-func (g Gate) TravelUnits(targetAperture float64) int {
-	units := int(math.Ceil(math.Abs(targetAperture)))
+// TravelUnits 返回把闸门从起始开度移动到目标开度需要占用的泵站行程额度。
+// 占用量按本次调整的实际行程（两开度之差的绝对值）计算，与闸门当前所处的开度位置无关。
+func TravelUnits(startingAperture, targetAperture float64) int {
+	units := int(math.Ceil(math.Abs(targetAperture - startingAperture)))
 	if units < 1 {
 		units = 1
 	}

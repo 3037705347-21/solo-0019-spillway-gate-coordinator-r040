@@ -90,7 +90,17 @@ func (m *MemoryRepository) Command(_ context.Context, id string) (domain.GateCom
 	return cloneCommand(command), nil
 }
 
-func (m *MemoryRepository) acquireDriveLocked(station, commandID string, units int) error {
+// canAcquireDriveLocked 仅检查泵站剩余额度是否足够，不改动账本。
+func (m *MemoryRepository) canAcquireDriveLocked(station string, units int) bool {
+	ledger, exists := m.stations[station]
+	if !exists {
+		return units <= domain.StationDriveBudget
+	}
+	return ledger.inUse+units <= domain.StationDriveBudget
+}
+
+// commitDriveBookingLocked 在提交点把一次调整预留的行程量记入泵站共享账本。
+func (m *MemoryRepository) commitDriveBookingLocked(station, commandID string, units int) {
 	ledger, exists := m.stations[station]
 	if !exists {
 		ledger = &stationDriveLedger{bookings: make(map[string]int)}
@@ -99,30 +109,27 @@ func (m *MemoryRepository) acquireDriveLocked(station, commandID string, units i
 	if units < 1 {
 		units = 1
 	}
-	if ledger.inUse+units > domain.StationDriveBudget {
-		return domain.Conflict("station_drive_budget_exhausted", "station drive budget is exhausted")
-	}
 	ledger.bookings[commandID] = units
 	ledger.inUse += units
-	return nil
 }
 
-func (m *MemoryRepository) releaseDriveLocked(station, commandID string, units int) {
+// releaseDriveLocked 按登记时预留的行程量归还额度；返回当初预留的精确数量。
+// 若该命令没有任何在途占用（例如复核从未成立），不改动账本。
+func (m *MemoryRepository) releaseDriveLocked(station, commandID string) int {
 	ledger, exists := m.stations[station]
 	if !exists {
-		return
+		return 0
 	}
-	if _, booked := ledger.bookings[commandID]; !booked {
-		return
+	units, booked := ledger.bookings[commandID]
+	if !booked {
+		return 0
 	}
 	delete(ledger.bookings, commandID)
-	if units < 0 {
-		units = 0
-	}
 	ledger.inUse -= units
 	if ledger.inUse < 0 {
 		ledger.inUse = 0
 	}
+	return units
 }
 
 func (m *MemoryRepository) ReviewCommand(
@@ -144,25 +151,29 @@ func (m *MemoryRepository) ReviewCommand(
 		return domain.GateCommand{}, domain.Gate{}, domain.NotFound("gate_not_found", "gate id was not found")
 	}
 
+	// 先在副本上完成所有状态转换和额度核算，任何一步失败都不得触碰共享账本或已存记录。
 	nextCommand := cloneCommand(command)
-	if decision.IsClear() {
-		nextCommand.ReserveDriveUnits(gate.TravelUnits(nextCommand.TargetAperture))
-		if err := m.acquireDriveLocked(gate.Station, nextCommand.ID, nextCommand.DriveUnits); err != nil {
-			return domain.GateCommand{}, domain.Gate{}, err
-		}
-	}
-
 	if err := nextCommand.Review(decision, token, now); err != nil {
 		return domain.GateCommand{}, domain.Gate{}, err
 	}
 
+	driveUnits := 0
 	nextGate := gate
 	if decision.IsClear() {
+		driveUnits = domain.TravelUnits(nextCommand.StartingAperture, nextCommand.TargetAperture)
+		nextCommand.ReserveDriveUnits(driveUnits)
+		if !m.canAcquireDriveLocked(gate.Station, driveUnits) {
+			return domain.GateCommand{}, domain.Gate{}, domain.Conflict("station_drive_budget_exhausted", "station drive budget is exhausted")
+		}
 		if err := nextGate.Reserve(nextCommand.ID, now); err != nil {
 			return domain.GateCommand{}, domain.Gate{}, err
 		}
 	}
 
+	// 全部校验通过后才提交：额度占用、命令状态与闸门占用在同一临界区内一起写入。
+	if decision.IsClear() {
+		m.commitDriveBookingLocked(gate.Station, nextCommand.ID, driveUnits)
+	}
 	m.commands[nextCommand.ID] = nextCommand
 	m.gates[nextGate.ID] = nextGate
 	return cloneCommand(nextCommand), nextGate, nil
@@ -212,8 +223,11 @@ func (m *MemoryRepository) ExecuteCommand(
 		if err := nextCommand.Complete(now); err != nil {
 			return domain.GateCommand{}, domain.Gate{}, err
 		}
-		m.releaseDriveLocked(nextGate.Station, nextCommand.ID, nextCommand.ReleasedDriveUnits())
 	}
+
+	// 调整到达终态（完成或中止）后，按复核时预留的行程量从共享账本精确归还；
+	// 归还数量以账本登记值为准，不受命令实体上字段清零的影响。
+	m.releaseDriveLocked(nextGate.Station, nextCommand.ID)
 
 	m.commands[nextCommand.ID] = nextCommand
 	m.gates[nextGate.ID] = nextGate
